@@ -1,0 +1,95 @@
+name: AxolotlVM Persistent VPS
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- Hostname ----------
+      - name: Set hostname
+        run: |
+          sudo hostnamectl set-hostname axolotlvm
+          echo "127.0.0.1 axolotlvm" | sudo tee -a /etc/hosts
+          hostnamectl
+
+      # ---------- Restore previous backup ----------
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Install unzip/zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip curl
+
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            sudo unzip -o ./backup/backup.zip -d /
+            echo "✅ Backup restored"
+          else
+            echo "ℹ️ No previous backup, starting fresh"
+          fi
+
+      # ---------- SSHx ----------
+      - name: Start SSHx
+        shell: bash
+        run: |
+          curl -fsSL https://sshx.io/get | sh
+          # start and capture the link
+          (sshx | tee /tmp/sshx.log) &
+          sleep 12
+          LINK="$(grep -oE 'https://sshx\.io/[0-9A-Za-z]+' /tmp/sshx.log | head -n 1 || true)"
+          echo "SSHX_LINK=$LINK" >> "$GITHUB_ENV"
+
+      - name: Show SSHx link
+        run: echo "👉 SSHx URL: $SSHX_LINK"
+
+      # ---------- Keep-alive loop + DuckDNS updates ----------
+      - name: Keep alive (~6h) and update DuckDNS
+        shell: bash
+        run: |
+          DOMAIN="${{ secrets.DUCKDNS_DOMAIN }}"
+          TOKEN="${{ secrets.DUCKDNS_TOKEN }}"
+
+          # Accept either "myname" or "myname.duckdns.org"
+          if [[ "$DOMAIN" =~ \.duckdns\.org$ ]]; then
+            DD_DOMAIN="${DOMAIN%%.duckdns.org}"
+            FQDN="$DOMAIN"
+          else
+            DD_DOMAIN="$DOMAIN"
+            FQDN="$DOMAIN.duckdns.org"
+          fi
+
+          echo "Using DuckDNS domain: $DD_DOMAIN  (FQDN: $FQDN)"
+
+          # runtime just under 6h so backup steps can run
+          MAX=$((6*60*60 - 120))
+          START=$(date +%s)
+
+          # first update immediately
+          curl -s "https://www.duckdns.org/update?domains=${DD_DOMAIN}&token=${TOKEN}&ip=" >/dev/null || true
+
+          while :; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START))
+            if (( ELAPSED >= MAX )); then
+              echo "⏰ Time's up (~6h). Exiting loop for backup."
+              break
+            fi
+
+            # update DuckDNS every 5 minutes
+            if (( ELAPSED % 300 == 0 )); then
+              curl -s "
